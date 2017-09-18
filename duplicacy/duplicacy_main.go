@@ -1073,8 +1073,8 @@ func copySnapshots(context *cli.Context) {
                                                     "Enter destination storage password:",false, false)
     }
 
-    sourceStorage.SetRateLimits(context.Int("download-rate-limit"), 0)
-    destinationStorage.SetRateLimits(0, context.Int("upload-rate-limit"))
+    sourceStorage.SetRateLimits(context.Int("download-limit-rate"), 0)
+    destinationStorage.SetRateLimits(0, context.Int("upload-limit-rate"))
 
     destinationManager := duplicacy.CreateBackupManager(destination.SnapshotID, destinationStorage, repository,
                                                         destinationPassword)
@@ -1701,7 +1701,7 @@ func main() {
     app.Name = "duplicacy"
     app.HelpName = "duplicacy"
     app.Usage = "A new generation cloud backup tool based on lock-free deduplication"
-    app.Version = "2.0.8"
+    app.Version = "2.0.9"
 
     // If the program is interrupted, call the RunAtError function.
     c := make(chan os.Signal, 1)                                       
