@@ -1631,7 +1631,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 
     referencedFossils := make(map[string]bool)
 
-    // Find fossil collections previsouly created, and delete fossils and temporary files in them if they are
+    // Find fossil collections previously created, and delete fossils and temporary files in them if they are
     // deletable.
     for _, collectionName := range collections {
 
@@ -2067,7 +2067,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
                          snapshot.ID, snapshot.Revision)
             }
             manager.snapshotCache.DeleteFile(0, snapshotPath)
-            fmt.Fprintf(logFile, "Deleted snapshot %s at revision %d\n", snapshot.ID, snapshot.Revision)
+            fmt.Fprintf(logFile, "Deleted cached snapshot %s at revision %d\n", snapshot.ID, snapshot.Revision)
         }
     }
 
@@ -2076,12 +2076,16 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
                  "No fossil collection has been created since deleted snapshots did not reference any unique chunks")
     }
 
-    var latestSnapshot *Snapshot
+    var latestSnapshot *Snapshot = nil
     if len(allSnapshots[selfID]) > 0 {
         latestSnapshot = allSnapshots[selfID][len(allSnapshots[selfID]) - 1]
     }
 
-    manager.CleanSnapshotCache(latestSnapshot, allSnapshots)
+    if latestSnapshot != nil && !latestSnapshot.Flag {
+        manager.CleanSnapshotCache(latestSnapshot, allSnapshots)
+    } else {
+        manager.CleanSnapshotCache(nil, allSnapshots)
+    }
 
     return true
 }
