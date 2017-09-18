@@ -594,19 +594,21 @@ func (manager *SnapshotManager) ListAllFiles(storage Storage, top string) (allFi
             }
         }
 
-        if top == "chunks/" {
-            // We're listing all chunks so this is the perfect place to detect if a directory contains too many
-            // chunks. Create sub-directories if necessary
-            if len(files) > 1024 && !storage.IsFastListing() {
-                for i := 0; i < 256; i++ {
-                    subdir := dir + fmt.Sprintf("%02x\n", i)
-                    manager.storage.CreateDirectory(0, subdir)
+        if !manager.config.dryRun {
+            if top == "chunks/" {
+                // We're listing all chunks so this is the perfect place to detect if a directory contains too many
+                // chunks. Create sub-directories if necessary
+                if len(files) > 1024 && !storage.IsFastListing() {
+                    for i := 0; i < 256; i++ {
+                        subdir := dir + fmt.Sprintf("%02x\n", i)
+                        manager.storage.CreateDirectory(0, subdir)
+                    }
                 }
-            }
-        } else {
-            // Remove chunk sub-directories that are empty
-            if len(files) == 0 && strings.HasPrefix(dir, "chunks/") && dir != "chunks/" {
-                storage.DeleteFile(0, dir)
+            } else {
+                // Remove chunk sub-directories that are empty
+                if len(files) == 0 && strings.HasPrefix(dir, "chunks/") && dir != "chunks/" {
+                    storage.DeleteFile(0, dir)
+                }
             }
         }
     }
@@ -2215,11 +2217,9 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
         return nil
     }
 
-    if !manager.config.dryRun {
-        err = manager.snapshotCache.UploadFile(0, path, manager.fileChunk.GetBytes())
-        if err != nil {
-            LOG_WARN("DOWNLOAD_FILE_CACHE", "Failed to add the file %s to the snapshot cache: %v", path, err)
-        }
+    err = manager.snapshotCache.UploadFile(0, path, manager.fileChunk.GetBytes())
+    if err != nil {
+        LOG_WARN("DOWNLOAD_FILE_CACHE", "Failed to add the file %s to the snapshot cache: %v", path, err)
     }
 
     LOG_DEBUG("DOWNLOAD_FILE", "Downloaded file %s", path)
@@ -2229,9 +2229,6 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 
 // UploadFile uploads a non-chunk file from the storage.
 func (manager *SnapshotManager) UploadFile(path string, derivationKey string, content []byte) bool {
-    if manager.config.dryRun {
-        return true
-    }
     manager.fileChunk.Reset(false)
     manager.fileChunk.Write(content)
 
