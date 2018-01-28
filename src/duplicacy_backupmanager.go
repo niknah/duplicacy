@@ -620,7 +620,7 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 	var backupSkipNoFiles bool
 	var backupSkipped bool
 	if manager.config.skipNoFiles && len(uploadedEntries) == 0 {
-		LOG_INFO("SKIP_NO_FILES", "No file changed")
+		LOG_INFO("SKIP_NO_FILES", "No files changed")
 		backupSkipNoFiles = true
 	}
 	totalSnapshotChunkLength, numberOfNewSnapshotChunks,
