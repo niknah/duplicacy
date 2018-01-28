@@ -514,6 +514,11 @@ func setPreference(context *cli.Context) {
 		newPreference.DoNotSavePassword = triBool.IsTrue()
 	}
 
+	triBool = context.Generic("skip-no-files").(*TriBool)
+	if triBool.IsSet() {
+		newPreference.SkipNoFiles = triBool.IsTrue()
+	}
+
 	key := context.String("key")
 	value := context.String("value")
 
@@ -698,6 +703,7 @@ func backupRepository(context *cli.Context) {
 
 	backupManager.SetupSnapshotCache(preference.Name)
 	backupManager.SetDryRun(dryRun)
+	backupManager.SetSkipNoFiles(preference.SkipNoFiles)
 	backupManager.Backup(repository, quickMode, threads, context.String("t"), showStatistics, enableVSS)
 
 	runScript(context, preference.Name, "post")
@@ -1712,6 +1718,12 @@ func main() {
 				cli.GenericFlag{
 					Name:  "no-save-password",
 					Usage: "don't save password or access keys to keychain/keyring",
+					Value: &TriBool{},
+					Arg:   "true",
+				},
+				cli.GenericFlag{
+					Name:  "skip-no-files",
+					Usage: "Skip backup if there are no files to backup",
 					Value: &TriBool{},
 					Arg:   "true",
 				},

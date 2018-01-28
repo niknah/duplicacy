@@ -38,6 +38,9 @@ type BackupManager struct {
 func (manager *BackupManager) SetDryRun(dryRun bool) {
 	manager.config.dryRun = dryRun
 }
+func (manager *BackupManager) SetSkipNoFiles(skipNoFiles bool) {
+	manager.config.skipNoFiles = skipNoFiles
+}
 
 // CreateBackupManager creates a backup manager using the specified 'storage'.  'snapshotID' is a unique id to
 // identify snapshots created for this repository.  'top' is the top directory of the repository.  'password' is the
@@ -615,9 +618,17 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 	localSnapshot.FileSize = preservedFileSize + uploadedFileSize
 	localSnapshot.NumberOfFiles = int64(len(preservedEntries) + len(uploadedEntries))
 
+	var totalSnapshotChunkLength int64
+	var numberOfNewSnapshotChunks int
+	var backupSkipNoFiles bool
+	var backupSkipped bool
+	if manager.config.skipNoFiles && len(uploadedEntries) == 0 {
+		LOG_INFO("SKIP_NO_FILES", "No files changed")
+		backupSkipNoFiles = true
+	}
 	totalSnapshotChunkLength, numberOfNewSnapshotChunks,
-		totalUploadedSnapshotChunkLength, totalUploadedSnapshotChunkBytes :=
-		manager.UploadSnapshot(chunkMaker, chunkUploader, top, localSnapshot, chunkCache)
+		totalUploadedSnapshotChunkLength, totalUploadedSnapshotChunkBytes, backupSkipped =
+		manager.UploadSnapshot(chunkMaker, chunkUploader, top, localSnapshot, chunkCache, backupSkipNoFiles)
 
 	if showStatistics && !RunInBackground {
 		for _, entry := range uploadedEntries {
@@ -637,7 +648,9 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 	if !manager.config.dryRun {
 		manager.SnapshotManager.CleanSnapshotCache(localSnapshot, nil)
 	}
-	LOG_INFO("BACKUP_END", "Backup for %s at revision %d completed", top, localSnapshot.Revision)
+	if !backupSkipped {
+		LOG_INFO("BACKUP_END", "Backup for %s at revision %d completed", top, localSnapshot.Revision)
+	}
 
 	RunAtError = func() {}
 	RemoveIncompleteSnapshot()
@@ -1017,9 +1030,9 @@ func (encoder *fileEncoder) NextFile() (io.Reader, bool) {
 // UploadSnapshot uploads the specified snapshot to the storage. It turns Files, ChunkHashes, and ChunkLengths into
 // sequences of chunks, and uploads these chunks, and finally the snapshot file.
 func (manager *BackupManager) UploadSnapshot(chunkMaker *ChunkMaker, uploader *ChunkUploader, top string, snapshot *Snapshot,
-	chunkCache map[string]bool) (totalSnapshotChunkSize int64,
+	chunkCache map[string]bool, skipIfNoChunks bool) (totalSnapshotChunkSize int64,
 	numberOfNewSnapshotChunks int, totalUploadedSnapshotChunkSize int64,
-	totalUploadedSnapshotChunkBytes int64) {
+	totalUploadedSnapshotChunkBytes int64, backupSkipped bool) {
 
 	uploader.snapshotCache = manager.snapshotCache
 
@@ -1075,7 +1088,7 @@ func (manager *BackupManager) UploadSnapshot(chunkMaker *ChunkMaker, uploader *C
 		if err != nil {
 			LOG_ERROR("SNAPSHOT_MARSHAL", "Failed to encode the %s in the snapshot %s: %v",
 				sequenceType, manager.snapshotID, err)
-			return int64(0), 0, int64(0), int64(0)
+			return int64(0), 0, int64(0), int64(0), true
 		}
 
 		sequence := uploadSequenceFunc(bytes.NewReader(contents),
@@ -1109,14 +1122,19 @@ func (manager *BackupManager) UploadSnapshot(chunkMaker *ChunkMaker, uploader *C
 	description, err := snapshot.MarshalJSON()
 	if err != nil {
 		LOG_ERROR("SNAPSHOT_MARSHAL", "Failed to encode the snapshot %s: %v", manager.snapshotID, err)
-		return int64(0), 0, int64(0), int64(0)
+		return int64(0), 0, int64(0), int64(0), true
 	}
 
 	path := fmt.Sprintf("snapshots/%s/%d", manager.snapshotID, snapshot.Revision)
 	if !manager.config.dryRun {
-		manager.SnapshotManager.UploadFile(path, path, description)
+		if skipIfNoChunks && numberOfNewSnapshotChunks == 0 {
+			backupSkipped = true
+			LOG_INFO("SKIP_SNAPSHOT", "No files/chunks changed, skip snapshot")
+		} else {
+			manager.SnapshotManager.UploadFile(path, path, description)
+		}
 	}
-	return totalSnapshotChunkSize, numberOfNewSnapshotChunks, totalUploadedSnapshotChunkSize, totalUploadedSnapshotChunkBytes
+	return totalSnapshotChunkSize, numberOfNewSnapshotChunks, totalUploadedSnapshotChunkSize, totalUploadedSnapshotChunkBytes, backupSkipped
 }
 
 // Restore downloads a file from the storage.  If 'inPlace' is false, the download file is saved first to a temporary
