@@ -79,7 +79,7 @@ func (manager *BackupManager) SetupSnapshotCache(storageName string) bool {
 	preferencePath := GetDuplicacyPreferencePath()
 	cacheDir := path.Join(preferencePath, "cache", storageName)
 
-	storage, err := CreateFileStorage(cacheDir, 2, false, 1)
+	storage, err := CreateFileStorage(cacheDir, false, 1)
 	if err != nil {
 		LOG_ERROR("BACKUP_CACHE", "Failed to create the snapshot cache dir: %v", err)
 		return false
@@ -93,6 +93,7 @@ func (manager *BackupManager) SetupSnapshotCache(storageName string) bool {
 		}
 	}
 
+	storage.SetDefaultNestingLevels([]int{1}, 1)
 	manager.snapshotCache = storage
 	manager.SnapshotManager.snapshotCache = storage
 	return true
@@ -241,6 +242,9 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 				}
 			}
 
+			LOG_DEBUG("CHUNK_INCOMPLETE", "The incomplete snapshot contains %d files and %d chunks", len(incompleteSnapshot.Files), len(incompleteSnapshot.ChunkHashes))
+			LOG_DEBUG("CHUNK_INCOMPLETE", "Last chunk in the incomplete snapshot that exist in the storage: %d", lastCompleteChunk)
+
 			// Only keep those files whose chunks exist in the cache
 			var files []*Entry
 			for _, file := range incompleteSnapshot.Files {
@@ -280,7 +284,7 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 	// we simply treat all files as if they were new, and break them into chunks.
 	// Otherwise, we need to find those that are new or recently modified
 
-	if remoteSnapshot.Revision == 0 && incompleteSnapshot == nil {
+	if (remoteSnapshot.Revision == 0 || !quickMode) && incompleteSnapshot == nil {
 		modifiedEntries = localSnapshot.Files
 		for _, entry := range modifiedEntries {
 			totalModifiedFileSize += entry.Size
@@ -711,7 +715,7 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 // the same as 'top'.  'quickMode' will bypass files with unchanged sizes and timestamps.  'deleteMode' will
 // remove local files that don't exist in the snapshot. 'patterns' is used to include/exclude certain files.
 func (manager *BackupManager) Restore(top string, revision int, inPlace bool, quickMode bool, threads int, overwrite bool,
-	deleteMode bool, showStatistics bool, patterns []string) bool {
+	deleteMode bool, setOwner bool, showStatistics bool, patterns []string) bool {
 
 	startTime := time.Now().Unix()
 
@@ -878,7 +882,6 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 			if quickMode {
 				if file.IsSameAsFileInfo(stat) {
 					LOG_TRACE("RESTORE_SKIP", "File %s unchanged (by size and timestamp)", file.Path)
-					file.RestoreMetadata(fullPath, &stat)
 					continue
 				}
 			}
@@ -903,7 +906,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 			}
 			newFile.Close()
 
-			file.RestoreMetadata(fullPath, nil)
+			file.RestoreMetadata(fullPath, nil, setOwner)
 			if !showStatistics {
 				LOG_INFO("DOWNLOAD_DONE", "Downloaded %s (0)", file.Path)
 			}
@@ -915,9 +918,9 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 			totalFileSize, downloadedFileSize, startDownloadingTime) {
 			downloadedFileSize += file.Size
 			downloadedFiles = append(downloadedFiles, file)
+			file.RestoreMetadata(fullPath, nil, setOwner)
 		}
 
-		file.RestoreMetadata(fullPath, nil)
 	}
 
 	if deleteMode && len(patterns) == 0 {
@@ -933,7 +936,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 	for _, entry := range remoteSnapshot.Files {
 		if entry.IsDir() && !entry.IsLink() {
 			dir := joinPath(top, entry.Path)
-			entry.RestoreMetadata(dir, nil)
+			entry.RestoreMetadata(dir, nil, setOwner)
 		}
 	}
 
@@ -1212,13 +1215,15 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 			// truncated portion of the existing file
 			for i := entry.StartChunk; i <= entry.EndChunk+1; i++ {
 				hasher := manager.config.NewKeyedHasher(manager.config.HashKey)
-				chunkSize := 1 // the size of extra chunk beyond EndChunk
+				chunkSize := 0
 				if i == entry.StartChunk {
-					chunkSize -= entry.StartOffset
+					chunkSize = chunkDownloader.taskList[i].chunkLength - entry.StartOffset
 				} else if i == entry.EndChunk {
 					chunkSize = entry.EndOffset
 				} else if i > entry.StartChunk && i < entry.EndChunk {
 					chunkSize = chunkDownloader.taskList[i].chunkLength
+				} else {
+					chunkSize = 1 // the size of extra chunk beyond EndChunk
 				}
 				count := 0
 				for count < chunkSize {

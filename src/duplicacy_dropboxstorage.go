@@ -6,21 +6,21 @@ package duplicacy
 
 import (
 	"fmt"
-	"path"
 	"strings"
 
 	"github.com/gilbertchen/go-dropbox"
 )
 
 type DropboxStorage struct {
-	RateLimitedStorage
+	StorageBase
 
-	clients    []*dropbox.Files
-	storageDir string
+	clients        []*dropbox.Files
+	minimumNesting int // The minimum level of directories to dive into before searching for the chunk file.
+	storageDir     string
 }
 
 // CreateDropboxStorage creates a dropbox storage object.
-func CreateDropboxStorage(accessToken string, storageDir string, threads int) (storage *DropboxStorage, err error) {
+func CreateDropboxStorage(accessToken string, storageDir string, minimumNesting int, threads int) (storage *DropboxStorage, err error) {
 
 	var clients []*dropbox.Files
 	for i := 0; i < threads; i++ {
@@ -37,8 +37,9 @@ func CreateDropboxStorage(accessToken string, storageDir string, threads int) (s
 	}
 
 	storage = &DropboxStorage{
-		clients:    clients,
-		storageDir: storageDir,
+		clients:        clients,
+		storageDir:     storageDir,
+		minimumNesting: minimumNesting,
 	}
 
 	err = storage.CreateDirectory(0, "")
@@ -46,6 +47,8 @@ func CreateDropboxStorage(accessToken string, storageDir string, threads int) (s
 		return nil, fmt.Errorf("Can't create storage directory: %v", err)
 	}
 
+	storage.DerivedStorage = storage
+	storage.SetDefaultNestingLevels([]int{1}, 1)
 	return storage, nil
 }
 
@@ -177,66 +180,6 @@ func (storage *DropboxStorage) GetFileInfo(threadIndex int, filePath string) (ex
 	}
 
 	return true, output.Tag == "folder", int64(output.Size), nil
-}
-
-// FindChunk finds the chunk with the specified id.  If 'isFossil' is true, it will search for chunk files with
-// the suffix '.fsl'.
-func (storage *DropboxStorage) FindChunk(threadIndex int, chunkID string, isFossil bool) (filePath string, exist bool, size int64, err error) {
-	dir := "/chunks"
-
-	suffix := ""
-	if isFossil {
-		suffix = ".fsl"
-	}
-
-	// The minimum level of directories to dive into before searching for the chunk file.
-	minimumLevel := 1
-
-	for level := 0; level*2 < len(chunkID); level++ {
-		if level >= minimumLevel {
-			filePath = path.Join(dir, chunkID[2*level:]) + suffix
-			var size int64
-			exist, _, size, err = storage.GetFileInfo(threadIndex, filePath)
-			if err != nil {
-				return "", false, 0, err
-			}
-			if exist {
-				return filePath, exist, size, nil
-			}
-		}
-
-		// Find the subdirectory the chunk file may reside.
-		subDir := path.Join(dir, chunkID[2*level:2*level+2])
-		exist, _, _, err = storage.GetFileInfo(threadIndex, subDir)
-		if err != nil {
-			return "", false, 0, err
-		}
-
-		if exist {
-			dir = subDir
-			continue
-		}
-
-		if level < minimumLevel {
-			// Create the subdirectory if it doesn't exist.
-			err = storage.CreateDirectory(threadIndex, subDir)
-			if err != nil {
-				return "", false, 0, err
-			}
-
-			dir = subDir
-			continue
-		}
-
-		// Teh chunk must be under this subdirectory but it doesn't exist.
-		return path.Join(dir, chunkID[2*level:])[1:] + suffix, false, 0, nil
-
-	}
-
-	LOG_FATAL("CHUNK_FIND", "Chunk %s is still not found after having searched a maximum level of directories",
-		chunkID)
-	return "", false, 0, nil
-
 }
 
 // DownloadFile reads the file at 'filePath' into the chunk.

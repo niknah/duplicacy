@@ -16,6 +16,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"net/http"
+
+	_ "net/http/pprof"
 
 	"github.com/gilbertchen/cli"
 
@@ -138,6 +141,15 @@ func setGlobalOptions(context *cli.Context) {
 		ScriptEnabled = false
 	}
 
+	address := context.GlobalString("profile")
+	if address != "" {
+		go func() {
+			http.ListenAndServe(address, nil)
+		}()
+	}
+
+
+
 	duplicacy.RunInBackground = context.GlobalBool("background")
 }
 
@@ -216,13 +228,21 @@ func configRepository(context *cli.Context, init bool) {
 	var storageURL string
 
 	if init {
-		storageName = "default"
+		storageName = context.String("storage-name")
+		if len(storageName) == 0 {
+			storageName = "default"
+		}
 		snapshotID = context.Args()[0]
 		storageURL = context.Args()[1]
 	} else {
 		storageName = context.Args()[0]
 		snapshotID = context.Args()[1]
 		storageURL = context.Args()[2]
+
+		if strings.ToLower(storageName) == "ssh" {
+			duplicacy.LOG_ERROR("PREFERENCE_INVALID", "'%s' is an invalid storage name", storageName)
+			return
+		}
 	}
 
 	var repository string
@@ -362,12 +382,14 @@ func configRepository(context *cli.Context, init bool) {
 		}
 
 		var otherConfig *duplicacy.Config
+		var bitCopy bool
 		if context.String("copy") != "" {
 
 			otherPreference := duplicacy.FindPreference(context.String("copy"))
 
 			if otherPreference == nil {
-
+				duplicacy.LOG_ERROR("STORAGE_NOTFOUND", "Storage '%s' can't be found", context.String("copy"))
+				return
 			}
 
 			otherStorage := duplicacy.CreateStorage(*otherPreference, false, 1)
@@ -389,10 +411,16 @@ func configRepository(context *cli.Context, init bool) {
 				duplicacy.LOG_ERROR("STORAGE_NOT_CONFIGURED",
 					"The storage to copy the configuration from has not been initialized")
 			}
+
+			bitCopy = context.Bool("bit-identical")
 		}
 
-		duplicacy.ConfigStorage(storage, compressionLevel, averageChunkSize, maximumChunkSize,
-			minimumChunkSize, storagePassword, otherConfig)
+		iterations := context.Int("iterations")
+		if iterations == 0 {
+			iterations = duplicacy.CONFIG_DEFAULT_ITERATIONS
+		}
+		duplicacy.ConfigStorage(storage, iterations, compressionLevel, averageChunkSize, maximumChunkSize,
+			minimumChunkSize, storagePassword, otherConfig, bitCopy)
 	}
 
 	duplicacy.Preferences = append(duplicacy.Preferences, preference)
@@ -571,11 +599,50 @@ func changePassword(context *cli.Context) {
 		return
 	}
 
-	duplicacy.UploadConfig(storage, config, newPassword)
+	iterations := context.Int("iterations")
+	if iterations == 0 {
+		iterations = duplicacy.CONFIG_DEFAULT_ITERATIONS
+	}
+
+	description, err := json.MarshalIndent(config, "", "    ")
+	if err != nil {
+		duplicacy.LOG_ERROR("CONFIG_MARSHAL", "Failed to marshal the config: %v", err)
+		return
+	}
+
+	configPath := path.Join(duplicacy.GetDuplicacyPreferencePath(), "config")
+	err = ioutil.WriteFile(configPath, description, 0600)
+	if err != nil {
+		duplicacy.LOG_ERROR("CONFIG_SAVE", "Failed to save the old config to %s: %v", configPath, err)
+		return
+	}
+	duplicacy.LOG_INFO("CONFIG_SAVE", "The old config has been temporarily saved to %s", configPath)
+
+	removeLocalCopy := false
+	defer func() {
+		if removeLocalCopy {
+			err = os.Remove(configPath)
+			if err != nil {
+				duplicacy.LOG_WARN("CONFIG_CLEAN", "Failed to delete %s: %v", configPath, err)
+			} else {
+				duplicacy.LOG_INFO("CONFIG_CLEAN", "The local copy of the old config has been removed")
+			}
+		}
+	} ()
+
+	err = storage.DeleteFile(0, "config")
+	if err != nil {
+		duplicacy.LOG_ERROR("CONFIG_DELETE", "Failed to delete the old config from the storage: %v", err)
+		return
+	}
+
+	duplicacy.UploadConfig(storage, config, newPassword, iterations)
 
 	duplicacy.SavePassword(*preference, "password", newPassword)
 
 	duplicacy.LOG_INFO("STORAGE_SET", "The password for storage %s has been changed", preference.StorageURL)
+
+	removeLocalCopy = true
 }
 
 func backupRepository(context *cli.Context) {
@@ -676,6 +743,8 @@ func restoreRepository(context *cli.Context) {
 	quickMode := !context.Bool("hash")
 	overwrite := context.Bool("overwrite")
 	deleteMode := context.Bool("delete")
+	setOwner := !context.Bool("ignore-owner")
+
 	showStatistics := context.Bool("stats")
 
 	var patterns []string
@@ -717,7 +786,7 @@ func restoreRepository(context *cli.Context) {
 	duplicacy.SavePassword(*preference, "password", password)
 
 	backupManager.SetupSnapshotCache(preference.Name)
-	backupManager.Restore(repository, revision, true, quickMode, threads, overwrite, deleteMode, showStatistics, patterns)
+	backupManager.Restore(repository, revision, true, quickMode, threads, overwrite, deleteMode, setOwner, showStatistics, patterns)
 
 	runScript(context, preference.Name, "post")
 }
@@ -1117,6 +1186,7 @@ func infoStorage(context *cli.Context) {
 		duplicacy.SetKeyringFile(path.Join(preferencePath, "keyring"))
 	}
 
+	resetPasswords := context.Bool("reset-passwords")
 	isEncrypted := context.Bool("e")
 	preference := duplicacy.Preference{
 		Name:              "default",
@@ -1126,12 +1196,23 @@ func infoStorage(context *cli.Context) {
 		DoNotSavePassword: true,
 	}
 
-	password := ""
-	if isEncrypted {
-		password = duplicacy.GetPassword(preference, "password", "Enter the storage password:", false, false)
+	storageName := context.String("storage-name")
+	if storageName != "" {
+		preference.Name = storageName
 	}
 
-	storage := duplicacy.CreateStorage(preference, context.Bool("reset-passwords"), 1)
+	if resetPasswords {
+		// We don't want password entered for the info command to overwrite the saved password for the default storage,
+		// so we simply assign an empty name.
+		preference.Name = ""
+	}
+
+	password := ""
+	if isEncrypted {
+		password = duplicacy.GetPassword(preference, "password", "Enter the storage password:", false, resetPasswords)
+	}
+
+	storage := duplicacy.CreateStorage(preference, resetPasswords, 1)
 	config, isStorageEncrypted, err := duplicacy.DownloadConfig(storage, password)
 
 	if isStorageEncrypted {
@@ -1143,6 +1224,19 @@ func infoStorage(context *cli.Context) {
 	} else {
 		config.Print()
 	}
+
+	dirs, _, err := storage.ListFiles(0, "snapshots/")
+	if err != nil {
+		duplicacy.LOG_WARN("STORAGE_LIST", "Failed to list repository ids: %v", err)
+		return
+	}
+
+	for _, dir := range dirs {
+		if len(dir) > 0 && dir[len(dir)-1] == '/' {
+			duplicacy.LOG_INFO("STORAGE_SNAPSHOT", "%s", dir[0:len(dir) - 1])
+		}
+	}
+
 }
 
 func main() {
@@ -1162,23 +1256,33 @@ func main() {
 				cli.StringFlag{
 					Name:     "chunk-size, c",
 					Value:    "4M",
-					Usage:    "the average size of chunks",
-					Argument: "4M",
+					Usage:    "the average size of chunks (defaults to 4M)",
+					Argument: "<size>",
 				},
 				cli.StringFlag{
 					Name:     "max-chunk-size, max",
-					Usage:    "the maximum size of chunks (defaults to chunk-size * 4)",
-					Argument: "16M",
+					Usage:    "the maximum size of chunks (defaults to chunk-size*4)",
+					Argument: "<size>",
 				},
 				cli.StringFlag{
 					Name:     "min-chunk-size, min",
-					Usage:    "the minimum size of chunks (defaults to chunk-size / 4)",
-					Argument: "1M",
+					Usage:    "the minimum size of chunks (defaults to chunk-size/4)",
+					Argument: "<size>",
+				},
+				cli.IntFlag{
+					Name:     "iterations",
+					Usage:    "the number of iterations used in storage key deriviation (default is 16384)",
+					Argument: "<i>",
 				},
 				cli.StringFlag{
 					Name:     "pref-dir",
-					Usage:    "Specify alternate location for .duplicacy preferences directory (absolute or relative to current directory)",
-					Argument: "<preferences directory path>",
+					Usage:    "alternate location for the .duplicacy directory (absolute or relative to current directory)",
+					Argument: "<path>",
+				},
+				cli.StringFlag{
+					Name:     "storage-name",
+					Usage:    "assign a name to the storage",
+					Argument: "<name>",
 				},
 			},
 			Usage:     "Initialize the storage if necessary and the current directory as the repository",
@@ -1215,7 +1319,7 @@ func main() {
 				},
 				cli.BoolFlag{
 					Name:  "dry-run",
-					Usage: "Dry run for testing, don't backup anything. Use with -stats and -d",
+					Usage: "dry run for testing, don't backup anything. Use with -stats and -d",
 				},
 				cli.BoolFlag{
 					Name:  "vss",
@@ -1251,6 +1355,10 @@ func main() {
 				cli.BoolFlag{
 					Name:  "delete",
 					Usage: "delete files not in the snapshot",
+				},
+				cli.BoolFlag{
+					Name:  "ignore-owner",
+					Usage: "do not set the original uid/gid on restored files",
 				},
 				cli.BoolFlag{
 					Name:  "stats",
@@ -1526,6 +1634,11 @@ func main() {
 					Usage:    "change the password used to access the specified storage",
 					Argument: "<storage name>",
 				},
+				cli.IntFlag{
+					Name:     "iterations",
+					Usage:    "the number of iterations used in storage key deriviation (default is 16384)",
+					Argument: "<i>",
+				},
 			},
 			Usage:     "Change the storage password",
 			ArgsUsage: " ",
@@ -1537,28 +1650,37 @@ func main() {
 			Flags: []cli.Flag{
 				cli.BoolFlag{
 					Name:  "encrypt, e",
-					Usage: "Encrypt the storage with a password",
+					Usage: "encrypt the storage with a password",
 				},
 				cli.StringFlag{
 					Name:     "chunk-size, c",
 					Value:    "4M",
-					Usage:    "the average size of chunks",
-					Argument: "4M",
+					Usage:    "the average size of chunks (default is 4M)",
+					Argument: "<size>",
 				},
 				cli.StringFlag{
 					Name:     "max-chunk-size, max",
-					Usage:    "the maximum size of chunks (defaults to chunk-size * 4)",
-					Argument: "16M",
+					Usage:    "the maximum size of chunks (default is chunk-size*4)",
+					Argument: "<size>",
 				},
 				cli.StringFlag{
 					Name:     "min-chunk-size, min",
-					Usage:    "the minimum size of chunks (defaults to chunk-size / 4)",
-					Argument: "1M",
+					Usage:    "the minimum size of chunks (default is chunk-size/4)",
+					Argument: "<size>",
+				},
+				cli.IntFlag{
+					Name:     "iterations",
+					Usage:    "the number of iterations used in storage key deriviation (default is 16384)",
+					Argument: "<i>",
 				},
 				cli.StringFlag{
 					Name:     "copy",
 					Usage:    "make the new storage compatible with an existing one to allow for copy operations",
 					Argument: "<storage name>",
+				},
+				cli.BoolFlag{
+					Name:     "bit-identical",
+					Usage:    "(when using -copy) make the new storage bit-identical to also allow rsync etc.",
 				},
 			},
 			Usage:     "Add an additional storage to be used for the existing repository",
@@ -1670,6 +1792,11 @@ func main() {
 					Usage:    "retrieve saved passwords from the specified repository",
 					Argument: "<repository directory>",
 				},
+				cli.StringFlag{
+					Name:     "storage-name",
+					Usage:    "the storage name to be assigned to the storage url",
+					Argument: "<name>",
+				},
 				cli.BoolFlag{
 					Name:  "reset-passwords",
 					Usage: "take passwords from input rather than keychain/keyring",
@@ -1706,13 +1833,19 @@ func main() {
 			Name:  "background",
 			Usage: "read passwords, tokens, or keys only from keychain/keyring or env",
 		},
-	}
+		cli.StringFlag{
+			Name:     "profile",
+			Value:    "",
+			Usage:    "enable the profiling tool and listen on the specified address:port",
+			Argument: "<address:port>",
+		},
+}
 
 	app.HideVersion = true
 	app.Name = "duplicacy"
 	app.HelpName = "duplicacy"
 	app.Usage = "A new generation cloud backup tool based on lock-free deduplication"
-	app.Version = "2.0.9"
+	app.Version = "2.0.10"
 
 	// If the program is interrupted, call the RunAtError function.
 	c := make(chan os.Signal, 1)

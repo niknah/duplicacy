@@ -9,6 +9,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,15 @@ var DEFAULT_KEY = []byte("duplicacy")
 // standard zlib levels of -1 to 9.
 var DEFAULT_COMPRESSION_LEVEL = 100
 
+// The new header of the config file (to differentiate from the old format where the salt and iterations are fixed)
+var CONFIG_HEADER = "duplicacy\001"
+
+// The length of the salt used in the new format
+var CONFIG_SALT_LENGTH = 32
+
+// The default iterations for key derivation
+var CONFIG_DEFAULT_ITERATIONS = 16384
+
 type Config struct {
 	CompressionLevel int `json:"compression-level"`
 	AverageChunkSize int `json:"average-chunk-size"`
@@ -35,6 +45,8 @@ type Config struct {
 	MinimumChunkSize int `json:"min-chunk-size"`
 
 	ChunkSeed []byte `json:"chunk-seed"`
+
+	FixedNesting bool `json:"fixed-nesting"`
 
 	// Use HMAC-SHA256(hashKey, plaintext) as the chunk hash.
 	// Use HMAC-SHA256(idKey, chunk hash) as the file name of the chunk
@@ -53,7 +65,7 @@ type Config struct {
 	// for encrypting a non-chunk file
 	FileKey []byte `json:"-"`
 
-	chunkPool      chan *Chunk `json:"-"`
+	chunkPool      chan *Chunk
 	numberOfChunks int32
 	dryRun         bool
 }
@@ -131,13 +143,14 @@ func (config *Config) Print() {
 }
 
 func CreateConfigFromParameters(compressionLevel int, averageChunkSize int, maximumChunkSize int, mininumChunkSize int,
-	isEncrypted bool, copyFrom *Config) (config *Config) {
+	isEncrypted bool, copyFrom *Config, bitCopy bool) (config *Config) {
 
 	config = &Config{
 		CompressionLevel: compressionLevel,
 		AverageChunkSize: averageChunkSize,
 		MaximumChunkSize: maximumChunkSize,
 		MinimumChunkSize: mininumChunkSize,
+		FixedNesting:     true,
 	}
 
 	if isEncrypted {
@@ -169,6 +182,12 @@ func CreateConfigFromParameters(compressionLevel int, averageChunkSize int, maxi
 
 		config.ChunkSeed = copyFrom.ChunkSeed
 		config.HashKey = copyFrom.HashKey
+
+		if bitCopy {
+			config.IDKey = copyFrom.IDKey
+			config.ChunkKey = copyFrom.ChunkKey
+			config.FileKey = copyFrom.FileKey
+		}
 	}
 
 	config.chunkPool = make(chan *Chunk, runtime.NumCPU()*16)
@@ -316,10 +335,45 @@ func DownloadConfig(storage Storage, password string) (config *Config, isEncrypt
 		return nil, false, err
 	}
 
+	if len(configFile.GetBytes()) < len(ENCRYPTION_HEADER) {
+		return nil, false, fmt.Errorf("The storage has an invalid config file")
+	}
+
+	if string(configFile.GetBytes()[:len(ENCRYPTION_HEADER)-1]) == ENCRYPTION_HEADER[:len(ENCRYPTION_HEADER)-1] && len(password) == 0 {
+		return nil, true, fmt.Errorf("The storage is likely to have been initialized with a password before")
+	}
+
 	var masterKey []byte
 
 	if len(password) > 0 {
-		masterKey = GenerateKeyFromPassword(password)
+
+		if string(configFile.GetBytes()[:len(ENCRYPTION_HEADER)]) == ENCRYPTION_HEADER {
+			// This is the old config format with a static salt and a fixed number of iterations
+			masterKey = GenerateKeyFromPassword(password, DEFAULT_KEY, CONFIG_DEFAULT_ITERATIONS)
+			LOG_TRACE("CONFIG_FORMAT", "Using a static salt and %d iterations for key derivation", CONFIG_DEFAULT_ITERATIONS)
+		} else if string(configFile.GetBytes()[:len(CONFIG_HEADER)]) == CONFIG_HEADER {
+			// This is the new config format with a random salt and a configurable number of iterations
+			encryptedLength := len(configFile.GetBytes()) - CONFIG_SALT_LENGTH - 4
+
+			// Extract the salt and the number of iterations
+			saltStart := configFile.GetBytes()[len(CONFIG_HEADER):]
+			iterations := binary.LittleEndian.Uint32(saltStart[CONFIG_SALT_LENGTH : CONFIG_SALT_LENGTH+4])
+			LOG_TRACE("CONFIG_ITERATIONS", "Using %d iterations for key derivation", iterations)
+			masterKey = GenerateKeyFromPassword(password, saltStart[:CONFIG_SALT_LENGTH], int(iterations))
+
+			// Copy to a temporary buffer to replace the header and remove the salt and the number of riterations
+			var encrypted bytes.Buffer
+			encrypted.Write([]byte(ENCRYPTION_HEADER))
+			encrypted.Write(saltStart[CONFIG_SALT_LENGTH+4:])
+
+			configFile.Reset(false)
+			configFile.Write(encrypted.Bytes())
+			if len(configFile.GetBytes()) != encryptedLength {
+				LOG_ERROR("CONFIG_DOWNLOAD", "Encrypted config has %d bytes instead of expected %d bytes", len(configFile.GetBytes()), encryptedLength)
+			}
+		} else {
+			return nil, true, fmt.Errorf("The config file has an invalid header")
+		}
 
 		// Decrypt the config file.  masterKey == nil means no encryption.
 		err = configFile.Decrypt(masterKey, "")
@@ -331,23 +385,21 @@ func DownloadConfig(storage Storage, password string) (config *Config, isEncrypt
 	config = CreateConfig()
 
 	err = json.Unmarshal(configFile.GetBytes(), config)
-
 	if err != nil {
-		if bytes.Equal(configFile.GetBytes()[:9], []byte("duplicacy")) {
-			return nil, true, fmt.Errorf("The storage is likely to have been initialized with a password before")
-		} else {
-			return nil, false, fmt.Errorf("Failed to parse the config file: %v", err)
-		}
+		return nil, false, fmt.Errorf("Failed to parse the config file: %v", err)
 	}
+
+	storage.SetNestingLevels(config)
 
 	return config, false, nil
 
 }
 
-func UploadConfig(storage Storage, config *Config, password string) bool {
+func UploadConfig(storage Storage, config *Config, password string, iterations int) bool {
 
 	// This is the key to encrypt the config file.
 	var masterKey []byte
+	salt := make([]byte, CONFIG_SALT_LENGTH)
 
 	if len(password) > 0 {
 
@@ -356,7 +408,13 @@ func UploadConfig(storage Storage, config *Config, password string) bool {
 			return false
 		}
 
-		masterKey = GenerateKeyFromPassword(password)
+		_, err := rand.Read(salt)
+		if err != nil {
+			LOG_ERROR("CONFIG_KEY", "Failed to generate random salt: %v", err)
+			return false
+		}
+
+		masterKey = GenerateKeyFromPassword(password, salt, iterations)
 	}
 
 	description, err := json.MarshalIndent(config, "", "    ")
@@ -373,10 +431,25 @@ func UploadConfig(storage Storage, config *Config, password string) bool {
 	if len(password) > 0 {
 		// Encrypt the config file with masterKey.  If masterKey is nil then no encryption is performed.
 		err = chunk.Encrypt(masterKey, "")
-
 		if err != nil {
 			LOG_ERROR("CONFIG_CREATE", "Failed to create the config file: %v", err)
 			return false
+		}
+
+		// The new encrypted format for config is CONFIG_HEADER + salt + #iterations + encrypted content
+		encryptedLength := len(chunk.GetBytes()) + CONFIG_SALT_LENGTH + 4
+
+		// Copy to a temporary buffer to replace the header and add the salt and the number of iterations
+		var encrypted bytes.Buffer
+		encrypted.Write([]byte(CONFIG_HEADER))
+		encrypted.Write(salt)
+		binary.Write(&encrypted, binary.LittleEndian, uint32(iterations))
+		encrypted.Write(chunk.GetBytes()[len(ENCRYPTION_HEADER):])
+
+		chunk.Reset(false)
+		chunk.Write(encrypted.Bytes())
+		if len(chunk.GetBytes()) != encryptedLength {
+			LOG_ERROR("CONFIG_CREATE", "Encrypted config has %d bytes instead of expected %d bytes", len(chunk.GetBytes()), encryptedLength)
 		}
 	}
 
@@ -403,8 +476,8 @@ func UploadConfig(storage Storage, config *Config, password string) bool {
 // ConfigStorage makes the general storage space available for storing duplicacy format snapshots.  In essence,
 // it simply creates a file named 'config' that stores various parameters as well as a set of keys if encryption
 // is enabled.
-func ConfigStorage(storage Storage, compressionLevel int, averageChunkSize int, maximumChunkSize int,
-	minimumChunkSize int, password string, copyFrom *Config) bool {
+func ConfigStorage(storage Storage, iterations int, compressionLevel int, averageChunkSize int, maximumChunkSize int,
+	minimumChunkSize int, password string, copyFrom *Config, bitCopy bool) bool {
 
 	exist, _, _, err := storage.GetFileInfo(0, "config")
 	if err != nil {
@@ -418,10 +491,10 @@ func ConfigStorage(storage Storage, compressionLevel int, averageChunkSize int, 
 	}
 
 	config := CreateConfigFromParameters(compressionLevel, averageChunkSize, maximumChunkSize, minimumChunkSize, len(password) > 0,
-		copyFrom)
+		copyFrom, bitCopy)
 	if config == nil {
 		return false
 	}
 
-	return UploadConfig(storage, config, password)
+	return UploadConfig(storage, config, password, iterations)
 }

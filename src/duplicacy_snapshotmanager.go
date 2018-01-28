@@ -592,24 +592,6 @@ func (manager *SnapshotManager) ListAllFiles(storage Storage, top string) (allFi
 				allSizes = append(allSizes, sizes[i])
 			}
 		}
-
-		if !manager.config.dryRun {
-			if top == "chunks/" {
-				// We're listing all chunks so this is the perfect place to detect if a directory contains too many
-				// chunks. Create sub-directories if necessary
-				if len(files) > 1024 && !storage.IsFastListing() {
-					for i := 0; i < 256; i++ {
-						subdir := dir + fmt.Sprintf("%02x\n", i)
-						manager.storage.CreateDirectory(0, subdir)
-					}
-				}
-			} else {
-				// Remove chunk sub-directories that are empty
-				if len(files) == 0 && strings.HasPrefix(dir, "chunks/") && dir != "chunks/" {
-					storage.DeleteFile(0, dir)
-				}
-			}
-		}
 	}
 
 	return allFiles, allSizes
@@ -835,7 +817,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 				if !found {
 					if !searchFossils {
 						missingChunks += 1
-						LOG_WARN("SNAPHOST_VALIDATE",
+						LOG_WARN("SNAPSHOT_VALIDATE",
 							"Chunk %s referenced by snapshot %s at revision %d does not exist",
 							chunkID, snapshotID, revision)
 						continue
@@ -843,14 +825,14 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 
 					chunkPath, exist, size, err := manager.storage.FindChunk(0, chunkID, true)
 					if err != nil {
-						LOG_ERROR("SNAPHOST_VALIDATE", "Failed to check the existence of chunk %s: %v",
+						LOG_ERROR("SNAPSHOT_VALIDATE", "Failed to check the existence of chunk %s: %v",
 							chunkID, err)
 						return false
 					}
 
 					if !exist {
 						missingChunks += 1
-						LOG_WARN("SNAPHOST_VALIDATE",
+						LOG_WARN("SNAPSHOT_VALIDATE",
 							"Chunk %s referenced by snapshot %s at revision %d does not exist",
 							chunkID, snapshotID, revision)
 						continue
@@ -859,7 +841,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 					if resurrect {
 						manager.resurrectChunk(chunkPath, chunkID)
 					} else {
-						LOG_WARN("SNAPHOST_FOSSIL", "Chunk %s referenced by snapshot %s at revision %d "+
+						LOG_WARN("SNAPSHOT_FOSSIL", "Chunk %s referenced by snapshot %s at revision %d "+
 							"has been marked as a fossil", chunkID, snapshotID, revision)
 					}
 
@@ -968,7 +950,7 @@ func (manager *SnapshotManager) ShowStatisticsTabular(snapshotMap map[string][]*
 		for _, snapshot := range snapshotList {
 			for _, chunkID := range manager.GetSnapshotChunks(snapshot) {
 				if earliestSeenChunks[chunkID] == 0 {
-					earliestSeenChunks[chunkID] = math.MaxInt64
+					earliestSeenChunks[chunkID] = math.MaxInt32
 				}
 				earliestSeenChunks[chunkID] = MinInt(earliestSeenChunks[chunkID], snapshot.Revision)
 			}
@@ -1131,6 +1113,14 @@ func (manager *SnapshotManager) RetrieveFile(snapshot *Snapshot, file *Entry, ou
 
 	manager.CreateChunkDownloader()
 
+	// Temporarily disable the snapshot cache of the download so that downloaded file chunks won't be saved
+	// to the cache.
+	snapshotCache := manager.chunkDownloader.snapshotCache
+	manager.chunkDownloader.snapshotCache = nil
+	defer func() {
+		manager.chunkDownloader.snapshotCache = snapshotCache
+	}()
+
 	fileHasher := manager.config.NewFileHasher()
 	alternateHash := false
 	if strings.HasPrefix(file.Hash, "#") {
@@ -1235,7 +1225,7 @@ func (manager *SnapshotManager) PrintFile(snapshotID string, revision int, path 
 		return false
 	}
 
-	fmt.Printf("%s\n", string(content))
+	fmt.Printf("%s", string(content))
 
 	return true
 }
@@ -1849,6 +1839,8 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 			// If revisions are specified ignore tags and the retention policy.
 			for _, snapshot := range snapshots {
 				if _, found := revisionMap[snapshot.Revision]; found {
+					LOG_DEBUG("SNAPSHOT_DELETE", "Snapshot %s at revision %d to be deleted - specified in command",
+						snapshot.ID, snapshot.Revision)
 					snapshot.Flag = true
 					toBeDeleted++
 				}
@@ -1886,12 +1878,16 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 				if i < len(retentionPolicies) {
 					if retentionPolicies[i].Interval == 0 {
 						// No snapshots to keep if interval is 0
+						LOG_DEBUG("SNAPSHOT_DELETE", "Snapshot %s at revision %d to be deleted - older than %d days",
+							snapshot.ID, snapshot.Revision, retentionPolicies[i].Age)
 						snapshot.Flag = true
 						toBeDeleted++
 					} else if lastSnapshotTime != 0 &&
 						int(snapshot.StartTime-lastSnapshotTime) < retentionPolicies[i].Interval*secondsInDay-600 {
 						// Delete the snapshot if it is too close to the last kept one.  Note that a tolerance of 10
 						// minutes was subtracted from the interval.
+						LOG_DEBUG("SNAPSHOT_DELETE", "Snapshot %s at revision %d to be deleted - older than %d days, less than %d days from previous",
+							snapshot.ID, snapshot.Revision, retentionPolicies[i].Age, retentionPolicies[i].Interval)
 						snapshot.Flag = true
 						toBeDeleted++
 					} else {
@@ -2296,6 +2292,10 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 		return nil
 	}
 
+	if len(derivationKey) > 64 {
+		derivationKey = derivationKey[len(derivationKey) - 64:]
+	}
+
 	err = manager.fileChunk.Decrypt(manager.config.FileKey, derivationKey)
 	if err != nil {
 		LOG_ERROR("DOWNLOAD_DECRYPT", "Failed to decrypt the file %s: %v", path, err)
@@ -2324,6 +2324,10 @@ func (manager *SnapshotManager) UploadFile(path string, derivationKey string, co
 		} else {
 			LOG_DEBUG("UPLOAD_FILE_CACHE", "Saved file %s to the snapshot cache", path)
 		}
+	}
+
+	if len(derivationKey) > 64 {
+		derivationKey = derivationKey[len(derivationKey) - 64:]
 	}
 
 	err := manager.fileChunk.Encrypt(manager.config.FileKey, derivationKey)
